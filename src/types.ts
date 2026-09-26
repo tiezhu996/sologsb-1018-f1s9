@@ -69,3 +69,18 @@ export interface PersistedPractice {
   project: PracticeProject
   version: 1
 }
+
+export interface LibraryItemMeta {
+  id: string
+  title: string
+  createdAt: string
+  updatedAt: string
+  attemptCount: number
+  targetAttempts: number
+}
+
+export interface PracticeLibraryMeta {
+  version: 2
+  activeId: string
+  items: LibraryItemMeta[]
+}

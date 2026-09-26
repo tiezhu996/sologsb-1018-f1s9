@@ -1,9 +1,9 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte'
   import { ProgressBar } from '@skeletonlabs/skeleton'
-  import { createSampleProject } from './sample'
-  import { clearPractice, loadPractice, savePractice } from './storage'
-  import type { Attempt, Intonation, PracticeProject, SenseGroup, StressLevel } from './types'
+  import { createEmptyProject, createSampleProject } from './sample'
+  import { clearAllPractices, createPractice, deletePractice, loadLibrary, loadPracticeById, savePractice, setActivePractice } from './storage'
+  import type { Attempt, Intonation, LibraryItemMeta, PracticeProject, SenseGroup, StressLevel } from './types'
 
   const intonationOptions: Array<{ value: Intonation; label: string }> = [
     { value: 'fall', label: '下降 ↘' },
@@ -14,6 +14,9 @@
   ]
 
   let project: PracticeProject = createSampleProject()
+  let library: LibraryItemMeta[] = []
+  let activeId = ''
+  let libraryOpen = false
   let loaded = false
   let saveStatus = '正在读取本机练习…'
   let online = true
@@ -51,6 +54,7 @@
   $: averageAccuracy = selectedAttempt?.scores.length ? Math.round(selectedAttempt.scores.reduce((sum, score) => sum + score.accuracy, 0) / selectedAttempt.scores.length) : 0
   $: averageDeviation = selectedAttempt?.scores.length ? Math.round(selectedAttempt.scores.reduce((sum, score) => sum + score.deviation, 0) / selectedAttempt.scores.length) : 0
   $: totalIssueCategories = project.errorCategories.map((category) => ({ category, count: project.attempts.flatMap((attempt) => attempt.wordIssues).filter((issue) => issue.category === category).length }))
+  $: sortedLibrary = [...library].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
 
   const clone = <T,>(value: T): T => structuredClone(value)
   const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
@@ -69,10 +73,112 @@
   function scheduleSave() {
     saveStatus = online ? '正在保存…' : '离线编辑中，稍后继续保存'
     window.clearTimeout(saveTimer)
-    saveTimer = window.setTimeout(async () => {
-      const target = await savePractice(project)
-      saveStatus = target === 'indexeddb' ? '已保存到本机' : '已保存到离线备份'
-    }, 250)
+    saveTimer = window.setTimeout(() => { void flushSave() }, 250)
+  }
+
+  async function flushSave() {
+    if (!activeId) return
+    window.clearTimeout(saveTimer)
+    const result = await savePractice(activeId, project)
+    upsertLibraryItem(result.item)
+    saveStatus = result.target === 'indexeddb' ? '已保存到本机' : '已保存到离线备份'
+  }
+
+  function upsertLibraryItem(item: LibraryItemMeta) {
+    library = library.some((entry) => entry.id === item.id) ? library.map((entry) => (entry.id === item.id ? item : entry)) : [...library, item]
+  }
+
+  function resetWorkspace(next: PracticeProject, id: string) {
+    stopPlayback()
+    project = next
+    activeId = id
+    undoStack = []
+    redoStack = []
+    selectedGroupId = next.groups[0]?.id ?? ''
+    selectedAttemptId = next.attempts.at(-1)?.id ?? ''
+  }
+
+  async function activatePractice(id: string): Promise<PracticeProject | null> {
+    const next = await loadPracticeById(id)
+    if (!next) return null
+    resetWorkspace(next, id)
+    await setActivePractice(id)
+    return next
+  }
+
+  async function switchPractice(id: string) {
+    if (id === activeId || !loaded) return
+    saveStatus = '正在保存当前练习…'
+    await flushSave()
+    const next = await activatePractice(id)
+    saveStatus = next ? `已切换到「${next.title}」` : '该练习读取失败'
+  }
+
+  async function createNewPractice() {
+    if (!loaded) return
+    await flushSave()
+    const fresh = createEmptyProject()
+    const item = await createPractice(fresh)
+    library = [...library, item]
+    resetWorkspace(fresh, item.id)
+    saveStatus = '已新建空白练习'
+  }
+
+  async function duplicatePractice(id: string) {
+    const source = id === activeId ? clone(project) : await loadPracticeById(id)
+    if (!source) return
+    const copy = clone(source)
+    copy.title = `${source.title || '未命名练习'} 副本`
+    copy.updatedAt = new Date().toISOString()
+    const item = await createPractice(copy)
+    library = [...library, item]
+    await setActivePractice(activeId)
+    saveStatus = `已复制为「${item.title}」`
+  }
+
+  async function renamePractice(item: LibraryItemMeta) {
+    const title = prompt('重命名练习', item.title)?.trim()
+    if (!title || title === item.title) return
+    if (item.id === activeId) {
+      editProject((draft) => { draft.title = title })
+      return
+    }
+    const target = await loadPracticeById(item.id)
+    if (!target) return
+    target.title = title
+    target.updatedAt = new Date().toISOString()
+    const result = await savePractice(item.id, target)
+    upsertLibraryItem(result.item)
+    await setActivePractice(activeId)
+    saveStatus = `已重命名为「${title}」`
+  }
+
+  async function removePractice(item: LibraryItemMeta) {
+    if (!confirm(`确定移除「${item.title}」吗？该练习的原文、录音、评分与反馈会一并删除。`)) return
+    if (item.id === activeId) window.clearTimeout(saveTimer)
+    await deletePractice(item.id)
+    library = library.filter((entry) => entry.id !== item.id)
+    if (item.id !== activeId) {
+      saveStatus = `已移除「${item.title}」`
+      return
+    }
+    const next = [...library].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0]
+    if (next) {
+      await activatePractice(next.id)
+      saveStatus = `已移除，并切换到「${next.title}」`
+    } else {
+      const fresh = createEmptyProject()
+      const created = await createPractice(fresh)
+      library = [created]
+      resetWorkspace(fresh, created.id)
+      saveStatus = '作品库已空，新建了一份空白练习'
+    }
+  }
+
+  function formatUpdatedAt(iso: string) {
+    const date = new Date(iso)
+    if (Number.isNaN(date.getTime())) return '—'
+    return date.toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
   }
 
   function undo() {
@@ -350,23 +456,22 @@
   }
 
   async function deleteAllData() {
-    if (!confirm('这会清除本机全部练习、录音与反馈，且不能撤销。')) return
+    if (!confirm('这会清除本机作品库中全部练习、录音与反馈，且不能撤销。')) return
     stopPlayback()
-    await clearPractice()
+    window.clearTimeout(saveTimer)
+    await clearAllPractices()
     const sample = createSampleProject()
-    project = sample
-    selectedGroupId = sample.groups[0]?.id ?? ''
-    selectedAttemptId = sample.attempts.at(-1)?.id ?? ''
-    undoStack = []
-    redoStack = []
-    await savePractice(project)
+    const item = await createPractice(sample)
+    library = [item]
+    resetWorkspace(sample, item.id)
+    saveStatus = '已清除本机数据'
   }
 
   function onKeydown(event: KeyboardEvent) {
     const command = event.ctrlKey || event.metaKey
     if (command && event.key.toLowerCase() === 's') {
       event.preventDefault()
-      void savePractice(project).then(() => { saveStatus = '已保存到本机' })
+      void flushSave()
     } else if (command && event.key.toLowerCase() === 'z') {
       event.preventDefault()
       event.shiftKey ? redo() : undo()
@@ -376,6 +481,9 @@
     } else if (event.altKey && event.key.toLowerCase() === 'r') {
       event.preventDefault()
       recording ? stopRecording() : void startRecording()
+    } else if (event.altKey && event.key.toLowerCase() === 'l') {
+      event.preventDefault()
+      libraryOpen = !libraryOpen
     } else if (event.altKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
       event.preventDefault()
       moveGroup(event.key === 'ArrowUp' ? -1 : 1)
@@ -389,12 +497,19 @@
 
   onMount(async () => {
     online = navigator.onLine
-    const saved = await loadPractice()
-    if (saved) project = saved
-    selectedGroupId = project.groups[0]?.id ?? ''
-    selectedAttemptId = project.attempts.at(-1)?.id ?? ''
+    const result = await loadLibrary()
+    if (result?.project) {
+      library = result.meta.items
+      resetWorkspace(result.project, result.meta.activeId)
+      saveStatus = '已恢复本机作品库'
+    } else {
+      if (result) library = result.meta.items
+      const item = await createPractice(project)
+      library = [...library, item]
+      resetWorkspace(project, item.id)
+      saveStatus = '示例练习已就绪'
+    }
     loaded = true
-    saveStatus = saved ? '已恢复本机练习' : '示例练习已就绪'
     window.addEventListener('online', () => { online = true })
     window.addEventListener('offline', () => { online = false })
     window.addEventListener('keydown', onKeydown)
@@ -430,6 +545,7 @@
     <div class="header-actions">
       <span class:offline={!online} class="connection badge">{online ? '在线' : '离线编辑'}</span>
       <span class="save-state">{saveStatus}</span>
+      <button class="btn btn-sm variant-soft-primary" on:click={() => (libraryOpen = true)}>作品库 · {library.length}</button>
       <button class="btn btn-sm variant-ghost" on:click={undo} disabled={!undoStack.length}>撤销</button>
       <button class="btn btn-sm variant-ghost" on:click={redo} disabled={!redoStack.length}>重做</button>
       <button class="btn btn-sm variant-ghost" on:click={resetSample}>恢复示例</button>
@@ -490,7 +606,7 @@
       <div class="shortcut-note">
         <strong>快捷操作</strong>
         <span>Alt + ↑/↓ 调整意群 · Alt+R 开始/停止录音</span>
-        <span>← / → 切换意群 · ⌘S 保存 · ⌘Z 撤销</span>
+        <span>← / → 切换意群 · Alt+L 作品库 · ⌘S 保存 · ⌘Z 撤销</span>
       </div>
     </aside>
 
@@ -685,6 +801,40 @@
       </section>
     {/if}
   </main>
+
+  {#if libraryOpen}
+    <button class="library-backdrop" aria-label="关闭作品库" on:click={() => (libraryOpen = false)}></button>
+    <aside class="library-panel">
+      <div class="section-heading">
+        <div><span class="eyebrow">LIBRARY</span><h2>作品库</h2></div>
+        <button class="btn btn-sm variant-ghost" on:click={() => (libraryOpen = false)}>收起 ✕</button>
+      </div>
+      <button class="btn variant-filled-primary new-practice" on:click={createNewPractice}>＋ 新建练习</button>
+      <div class="library-list">
+        {#each sortedLibrary as item (item.id)}
+          <div class:active={item.id === activeId} class="library-item">
+            <button class="library-item-main" on:click={() => switchPractice(item.id)}>
+              <span class="library-item-title">
+                <strong>{item.title}</strong>
+                {#if item.id === activeId}<span class="chapter-badge">当前</span>{/if}
+              </span>
+              <span class="library-item-meta">
+                <span>{Math.min(item.attemptCount, item.targetAttempts)} / {item.targetAttempts} 轮</span>
+                <span>更新于 {formatUpdatedAt(item.updatedAt)}</span>
+              </span>
+              <span class="mini-progress"><i style={`width:${Math.min(100, Math.round((item.attemptCount / Math.max(item.targetAttempts, 1)) * 100))}%`}></i></span>
+            </button>
+            <div class="library-item-actions">
+              <button class="btn btn-sm variant-ghost" on:click={() => renamePractice(item)}>改名</button>
+              <button class="btn btn-sm variant-ghost" on:click={() => duplicatePractice(item.id)}>复制</button>
+              <button class="btn btn-sm variant-ghost text-error-500" on:click={() => removePractice(item)}>移除</button>
+            </div>
+          </div>
+        {/each}
+      </div>
+      <p class="library-note">练习全部保存在本机，断网不丢失；切换前会自动保存当前这份。Alt+L 可快速开关本面板。</p>
+    </aside>
+  {/if}
 
   {#if !loaded}
     <div class="loading-overlay"><span class="loading-bar">正在恢复离线练习…</span></div>
