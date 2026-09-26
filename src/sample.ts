@@ -1,5 +1,20 @@
 import type { PracticeProject } from './types'
 
+export function createEmptyProject(): PracticeProject {
+  return {
+    title: '未命名练习',
+    sentence: '',
+    translation: '',
+    teacher: '陈老师',
+    targetAttempts: 5,
+    targetDuration: 10,
+    groups: [{ id: 'group-1', text: '第一个意群', stressWords: [], stressLevel: 1, pauseMs: 300, intonation: 'flat', note: '' }],
+    attempts: [],
+    errorCategories: ['声调', '韵尾', '重音位置', '连读', '气息', '语速'],
+    updatedAt: new Date().toISOString()
+  }
+}
+
 export function createSampleProject(): PracticeProject {
   const groups = [
     { id: 'group-1', text: '清晨的海风', stressWords: ['海风'], stressLevel: 2 as const, pauseMs: 420, intonation: 'flat' as const, note: '平稳起句，不要咬字过重。' },
